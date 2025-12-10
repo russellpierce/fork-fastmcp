@@ -6,9 +6,9 @@ import os
 import shutil
 import sys
 import warnings
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
-from typing import Any, Literal, TypeVar, cast, overload
+from typing import Any, Literal, TextIO, TypeVar, cast, overload
 
 import anyio
 import httpx
@@ -36,6 +36,7 @@ from fastmcp.client.auth.oauth import OAuth
 from fastmcp.mcp_config import MCPConfig, infer_transport_type_from_url
 from fastmcp.server.dependencies import get_http_headers
 from fastmcp.server.server import FastMCP
+from fastmcp.server.tasks.capabilities import get_task_capabilities
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.mcp_server_config.v1.environments.uv import UVEnvironment
 
@@ -46,16 +47,16 @@ ClientTransportT = TypeVar("ClientTransportT", bound="ClientTransport")
 
 __all__ = [
     "ClientTransport",
-    "SSETransport",
-    "StreamableHttpTransport",
-    "StdioTransport",
-    "PythonStdioTransport",
     "FastMCPStdioTransport",
-    "NodeStdioTransport",
-    "UvxStdioTransport",
-    "UvStdioTransport",
-    "NpxStdioTransport",
     "FastMCPTransport",
+    "NodeStdioTransport",
+    "NpxStdioTransport",
+    "PythonStdioTransport",
+    "SSETransport",
+    "StdioTransport",
+    "StreamableHttpTransport",
+    "UvStdioTransport",
+    "UvxStdioTransport",
     "infer_transport",
 ]
 
@@ -109,9 +110,8 @@ class ClientTransport(abc.ABC):
         # Basic representation for subclasses
         return f"<{self.__class__.__name__}>"
 
-    async def close(self):
+    async def close(self):  # noqa: B027
         """Close the transport."""
-        pass
 
     def _set_auth(self, auth: httpx.Auth | Literal["oauth"] | str | None):
         if auth is not None:
@@ -141,10 +141,10 @@ class WSTransport(ClientTransport):
     ) -> AsyncIterator[ClientSession]:
         try:
             from mcp.client.websocket import websocket_client
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
                 "The websocket transport is not available. Please install fastmcp[websockets] or install the websockets package manually."
-            )
+            ) from e
 
         async with websocket_client(self.url) as transport:
             read_stream, write_stream = transport
@@ -178,8 +178,8 @@ class SSETransport(ClientTransport):
 
         self.url = url
         self.headers = headers or {}
-        self._set_auth(auth)
         self.httpx_client_factory = httpx_client_factory
+        self._set_auth(auth)
 
         if isinstance(sse_read_timeout, int | float):
             sse_read_timeout = datetime.timedelta(seconds=float(sse_read_timeout))
@@ -187,7 +187,7 @@ class SSETransport(ClientTransport):
 
     def _set_auth(self, auth: httpx.Auth | Literal["oauth"] | str | None):
         if auth == "oauth":
-            auth = OAuth(self.url)
+            auth = OAuth(self.url, httpx_client_factory=self.httpx_client_factory)
         elif isinstance(auth, str):
             auth = BearerAuth(auth)
         self.auth = auth
@@ -207,7 +207,7 @@ class SSETransport(ClientTransport):
         # instead we simply leave the kwarg out if it's not provided
         if self.sse_read_timeout is not None:
             client_kwargs["sse_read_timeout"] = self.sse_read_timeout.total_seconds()
-        if session_kwargs.get("read_timeout_seconds", None) is not None:
+        if session_kwargs.get("read_timeout_seconds") is not None:
             read_timeout_seconds = cast(
                 datetime.timedelta, session_kwargs.get("read_timeout_seconds")
             )
@@ -248,16 +248,18 @@ class StreamableHttpTransport(ClientTransport):
 
         self.url = url
         self.headers = headers or {}
-        self._set_auth(auth)
         self.httpx_client_factory = httpx_client_factory
+        self._set_auth(auth)
 
         if isinstance(sse_read_timeout, int | float):
             sse_read_timeout = datetime.timedelta(seconds=float(sse_read_timeout))
         self.sse_read_timeout = sse_read_timeout
 
+        self._get_session_id_cb: Callable[[], str | None] | None = None
+
     def _set_auth(self, auth: httpx.Auth | Literal["oauth"] | str | None):
         if auth == "oauth":
-            auth = OAuth(self.url)
+            auth = OAuth(self.url, httpx_client_factory=self.httpx_client_factory)
         elif isinstance(auth, str):
             auth = BearerAuth(auth)
         self.auth = auth
@@ -277,7 +279,7 @@ class StreamableHttpTransport(ClientTransport):
         # instead we simply leave the kwarg out if it's not provided
         if self.sse_read_timeout is not None:
             client_kwargs["sse_read_timeout"] = self.sse_read_timeout
-        if session_kwargs.get("read_timeout_seconds", None) is not None:
+        if session_kwargs.get("read_timeout_seconds") is not None:
             client_kwargs["timeout"] = session_kwargs.get("read_timeout_seconds")
 
         if self.httpx_client_factory is not None:
@@ -288,11 +290,24 @@ class StreamableHttpTransport(ClientTransport):
             auth=self.auth,
             **client_kwargs,
         ) as transport:
-            read_stream, write_stream, _ = transport
+            read_stream, write_stream, get_session_id = transport
+            self._get_session_id_cb = get_session_id
             async with ClientSession(
                 read_stream, write_stream, **session_kwargs
             ) as session:
                 yield session
+
+    def get_session_id(self) -> str | None:
+        if self._get_session_id_cb:
+            try:
+                return self._get_session_id_cb()
+            except Exception:
+                return None
+        return None
+
+    async def close(self):
+        # Reset the session id callback
+        self._get_session_id_cb = None
 
     def __repr__(self) -> str:
         return f"<StreamableHttpTransport(url='{self.url}')>"
@@ -313,6 +328,7 @@ class StdioTransport(ClientTransport):
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         keep_alive: bool | None = None,
+        log_file: Path | TextIO | None = None,
     ):
         """
         Initialize a Stdio transport.
@@ -326,6 +342,11 @@ class StdioTransport(ClientTransport):
                        Defaults to True. When True, the subprocess remains active
                        after the connection context exits, allowing reuse in
                        subsequent connections.
+            log_file: Optional path or file-like object where subprocess stderr will
+                   be written. Can be a Path or TextIO object. Defaults to sys.stderr
+                   if not provided. When a Path is provided, the file will be created
+                   if it doesn't exist, or appended to if it does. When set, server
+                   errors will be written to this file instead of appearing in the console.
         """
         self.command = command
         self.args = args
@@ -334,6 +355,7 @@ class StdioTransport(ClientTransport):
         if keep_alive is None:
             keep_alive = True
         self.keep_alive = keep_alive
+        self.log_file = log_file
 
         self._session: ClientSession | None = None
         self._connect_task: asyncio.Task | None = None
@@ -368,7 +390,9 @@ class StdioTransport(ClientTransport):
                 args=self.args,
                 env=self.env,
                 cwd=self.cwd,
-                session_kwargs=session_kwargs,
+                log_file=self.log_file,
+                # TODO(ty): remove when ty supports Unpack[TypedDict] inference
+                session_kwargs=session_kwargs,  # type: ignore[arg-type]
                 ready_event=self._ready_event,
                 stop_event=self._stop_event,
                 session_future=session_future,
@@ -421,6 +445,7 @@ async def _stdio_transport_connect_task(
     args: list[str],
     env: dict[str, str] | None,
     cwd: str | None,
+    log_file: Path | TextIO | None,
     session_kwargs: SessionKwargs,
     ready_event: anyio.Event,
     stop_event: anyio.Event,
@@ -438,7 +463,18 @@ async def _stdio_transport_connect_task(
                     env=env,
                     cwd=cwd,
                 )
-                transport = await stack.enter_async_context(stdio_client(server_params))
+                # Handle log_file: Path needs to be opened, TextIO used as-is
+                if log_file is None:
+                    log_file_handle = sys.stderr
+                elif isinstance(log_file, Path):
+                    log_file_handle = stack.enter_context(log_file.open("a"))
+                else:
+                    # Must be TextIO - use it directly
+                    log_file_handle = log_file
+
+                transport = await stack.enter_async_context(
+                    stdio_client(server_params, errlog=log_file_handle)
+                )
                 read_stream, write_stream = transport
                 session_future.set_result(
                     await stack.enter_async_context(
@@ -471,6 +507,7 @@ class PythonStdioTransport(StdioTransport):
         cwd: str | None = None,
         python_cmd: str = sys.executable,
         keep_alive: bool | None = None,
+        log_file: Path | TextIO | None = None,
     ):
         """
         Initialize a Python transport.
@@ -485,6 +522,11 @@ class PythonStdioTransport(StdioTransport):
                        Defaults to True. When True, the subprocess remains active
                        after the connection context exits, allowing reuse in
                        subsequent connections.
+            log_file: Optional path or file-like object where subprocess stderr will
+                   be written. Can be a Path or TextIO object. Defaults to sys.stderr
+                   if not provided. When a Path is provided, the file will be created
+                   if it doesn't exist, or appended to if it does. When set, server
+                   errors will be written to this file instead of appearing in the console.
         """
         script_path = Path(script_path).resolve()
         if not script_path.is_file():
@@ -502,6 +544,7 @@ class PythonStdioTransport(StdioTransport):
             env=env,
             cwd=cwd,
             keep_alive=keep_alive,
+            log_file=log_file,
         )
         self.script_path = script_path
 
@@ -516,6 +559,7 @@ class FastMCPStdioTransport(StdioTransport):
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         keep_alive: bool | None = None,
+        log_file: Path | TextIO | None = None,
     ):
         script_path = Path(script_path).resolve()
         if not script_path.is_file():
@@ -529,6 +573,7 @@ class FastMCPStdioTransport(StdioTransport):
             env=env,
             cwd=cwd,
             keep_alive=keep_alive,
+            log_file=log_file,
         )
         self.script_path = script_path
 
@@ -544,6 +589,7 @@ class NodeStdioTransport(StdioTransport):
         cwd: str | None = None,
         node_cmd: str = "node",
         keep_alive: bool | None = None,
+        log_file: Path | TextIO | None = None,
     ):
         """
         Initialize a Node transport.
@@ -558,6 +604,11 @@ class NodeStdioTransport(StdioTransport):
                        Defaults to True. When True, the subprocess remains active
                        after the connection context exits, allowing reuse in
                        subsequent connections.
+            log_file: Optional path or file-like object where subprocess stderr will
+                   be written. Can be a Path or TextIO object. Defaults to sys.stderr
+                   if not provided. When a Path is provided, the file will be created
+                   if it doesn't exist, or appended to if it does. When set, server
+                   errors will be written to this file instead of appearing in the console.
         """
         script_path = Path(script_path).resolve()
         if not script_path.is_file():
@@ -570,7 +621,12 @@ class NodeStdioTransport(StdioTransport):
             full_args.extend(args)
 
         super().__init__(
-            command=node_cmd, args=full_args, env=env, cwd=cwd, keep_alive=keep_alive
+            command=node_cmd,
+            args=full_args,
+            env=env,
+            cwd=cwd,
+            keep_alive=keep_alive,
+            log_file=log_file,
         )
         self.script_path = script_path
 
@@ -707,6 +763,7 @@ class UvxStdioTransport(StdioTransport):
         env: dict[str, str] | None = None
         if env_vars:
             env = os.environ.copy()
+            env.update(env_vars)
 
         super().__init__(
             command="uvx",
@@ -810,12 +867,20 @@ class FastMCPTransport(ClientTransport):
             server_read, server_write = server_streams
 
             # Create a cancel scope for the server task
-            async with anyio.create_task_group() as tg:
+            async with (
+                anyio.create_task_group() as tg,
+                _enter_server_lifespan(server=self.server),
+            ):
+                # Build experimental capabilities
+                experimental_capabilities = get_task_capabilities()
+
                 tg.start_soon(
                     lambda: self.server._mcp_server.run(
                         server_read,
                         server_write,
-                        self.server._mcp_server.create_initialization_options(),
+                        self.server._mcp_server.create_initialization_options(
+                            experimental_capabilities=experimental_capabilities
+                        ),
                         raise_exceptions=self.raise_exceptions,
                     )
                 )
@@ -832,6 +897,18 @@ class FastMCPTransport(ClientTransport):
 
     def __repr__(self) -> str:
         return f"<FastMCPTransport(server='{self.server.name}')>"
+
+
+@contextlib.asynccontextmanager
+async def _enter_server_lifespan(
+    server: FastMCP | FastMCP1Server,
+) -> AsyncIterator[None]:
+    """Enters the server's lifespan context for FastMCP servers and does nothing for FastMCP 1 servers."""
+    if isinstance(server, FastMCP):
+        async with server._lifespan_manager():
+            yield
+    else:
+        yield
 
 
 class MCPConfigTransport(ClientTransport):
@@ -897,7 +974,7 @@ class MCPConfigTransport(ClientTransport):
 
         # if there's exactly one server, create a client for that server
         elif len(self.config.mcpServers) == 1:
-            self.transport = list(self.config.mcpServers.values())[0].to_transport()
+            self.transport = next(iter(self.config.mcpServers.values())).to_transport()
             self._underlying_transports.append(self.transport)
 
         # otherwise create a composite client

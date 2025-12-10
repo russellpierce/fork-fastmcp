@@ -61,7 +61,7 @@ from pydantic import (
 )
 from typing_extensions import NotRequired, TypedDict
 
-__all__ = ["json_schema_to_type", "JSONSchema"]
+__all__ = ["JSONSchema", "json_schema_to_type"]
 
 
 FORMAT_TYPES: dict[str, Any] = {
@@ -248,7 +248,7 @@ def _create_numeric_type(
         if v is not None
     }
 
-    return Annotated[base, Field(**constraints)] if constraints else base
+    return Annotated[base, Field(**constraints)] if constraints else base  # type: ignore[return-value]
 
 
 def _create_enum(name: str, values: list[Any]) -> type:
@@ -265,8 +265,8 @@ def _create_array_type(
     if isinstance(items, list):
         # Handle positional item schemas
         item_types = [_schema_to_type(s, schemas) for s in items]
-        combined = Union[tuple(item_types)]  # type: ignore # noqa: UP007
-        base = list[combined]
+        combined = Union[tuple(item_types)]  # type: ignore[arg-type] # noqa: UP007
+        base = list[combined]  # type: ignore[valid-type]
     else:
         # Handle single item schema
         item_type = _schema_to_type(items, schemas)
@@ -282,7 +282,7 @@ def _create_array_type(
         if v is not None
     }
 
-    return Annotated[base, Field(**constraints)] if constraints else base
+    return Annotated[base, Field(**constraints)] if constraints else base  # type: ignore[return-value]
 
 
 def _return_Any() -> Any:
@@ -368,7 +368,7 @@ def _schema_to_type(
                 return types[0]
         else:
             if has_null:
-                return Union[tuple(types + [type(None)])]  # type: ignore # noqa: UP007
+                return Union[(*types, type(None))]  # type: ignore
             else:
                 return Union[tuple(types)]  # type: ignore # noqa: UP007
 
@@ -389,7 +389,7 @@ def _schema_to_type(
             if len(types) == 1:
                 return types[0] | None  # type: ignore
             else:
-                return Union[tuple(types + [type(None)])]  # type: ignore # noqa: UP007
+                return Union[(*types, type(None))]  # type: ignore
         return Union[tuple(types)]  # type: ignore # noqa: UP007
 
     return _get_from_type_handler(schema, schemas)(schema)
@@ -578,7 +578,7 @@ def _create_dataclass(
             return _merge_defaults(data, original_schema)
         return data
 
-    setattr(cls, "_apply_defaults", _apply_defaults)
+    cls._apply_defaults = _apply_defaults  # type: ignore[attr-defined]
 
     # Store completed class
     _classes[cache_key] = cls

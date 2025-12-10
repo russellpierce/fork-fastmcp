@@ -1,15 +1,16 @@
-from collections.abc import Generator
 from urllib.parse import urlparse
 
 import httpx
 import pytest
 
 from fastmcp.client import Client
+from fastmcp.client.auth import OAuth
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.server.auth.auth import ClientRegistrationOptions
 from fastmcp.server.auth.providers.in_memory import InMemoryOAuthProvider
 from fastmcp.server.server import FastMCP
-from fastmcp.utilities.tests import HeadlessOAuth, run_server_in_process
+from fastmcp.utilities.http import find_available_port
+from fastmcp.utilities.tests import HeadlessOAuth, run_server_async
 
 
 def fastmcp_server(issuer_url: str):
@@ -18,7 +19,9 @@ def fastmcp_server(issuer_url: str):
         "TestServer",
         auth=InMemoryOAuthProvider(
             base_url=issuer_url,
-            client_registration_options=ClientRegistrationOptions(enabled=True),
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True, valid_scopes=["read", "write"]
+            ),
         ),
     )
 
@@ -35,31 +38,27 @@ def fastmcp_server(issuer_url: str):
     return server
 
 
-def run_server(host: str, port: int, **kwargs) -> None:
-    fastmcp_server(f"http://{host}:{port}").run(host=host, port=port, **kwargs)
+@pytest.fixture
+async def streamable_http_server():
+    """Start OAuth-enabled server."""
+    port = find_available_port()
+    server = fastmcp_server(f"http://127.0.0.1:{port}")
+    async with run_server_async(server, port=port, transport="http") as url:
+        yield url
 
 
 @pytest.fixture
-def streamable_http_server() -> Generator[str, None, None]:
-    with run_server_in_process(run_server, transport="http") as url:
-        yield f"{url}/mcp"
-
-
-@pytest.fixture()
 def client_unauthorized(streamable_http_server: str) -> Client:
     return Client(transport=StreamableHttpTransport(streamable_http_server))
 
 
-@pytest.fixture()
-def client_with_headless_oauth(
-    streamable_http_server: str,
-) -> Generator[Client, None, None]:
+@pytest.fixture
+def client_with_headless_oauth(streamable_http_server: str) -> Client:
     """Client with headless OAuth that bypasses browser interaction."""
-    client = Client(
+    return Client(
         transport=StreamableHttpTransport(streamable_http_server),
-        auth=HeadlessOAuth(mcp_url=streamable_http_server),
+        auth=HeadlessOAuth(mcp_url=streamable_http_server, scopes=["read", "write"]),
     )
-    yield client
 
 
 async def test_unauthorized(client_unauthorized: Client):
@@ -126,3 +125,49 @@ async def test_oauth_server_metadata_discovery(streamable_http_server: str):
         # The endpoints should be properly formed URLs
         assert metadata["authorization_endpoint"].startswith(server_base_url)
         assert metadata["token_endpoint"].startswith(server_base_url)
+
+
+class TestOAuthClientUrlHandling:
+    """Tests for OAuth client URL handling (issue #2573)."""
+
+    def test_oauth_preserves_full_url_with_path(self):
+        """OAuth client should preserve the full MCP URL including path components.
+
+        This is critical for servers hosted under path-based endpoints like
+        mcp.example.com/server1/v1.0/mcp where OAuth metadata discovery needs
+        the full path to find the correct .well-known endpoints.
+        """
+        mcp_url = "https://mcp.example.com/server1/v1.0/mcp"
+        oauth = OAuth(mcp_url=mcp_url)
+
+        # The full URL should be preserved for OAuth discovery
+        assert oauth.context.server_url == mcp_url
+
+        # The stored mcp_url should match
+        assert oauth.mcp_url == mcp_url
+
+    def test_oauth_preserves_root_url(self):
+        """OAuth client should work correctly with root-level URLs."""
+        mcp_url = "https://mcp.example.com"
+        oauth = OAuth(mcp_url=mcp_url)
+
+        assert oauth.context.server_url == mcp_url
+        assert oauth.mcp_url == mcp_url
+
+    def test_oauth_normalizes_trailing_slash(self):
+        """OAuth client should normalize trailing slashes for consistency."""
+        mcp_url_with_slash = "https://mcp.example.com/api/mcp/"
+        oauth = OAuth(mcp_url=mcp_url_with_slash)
+
+        # Trailing slash should be stripped
+        expected = "https://mcp.example.com/api/mcp"
+        assert oauth.context.server_url == expected
+        assert oauth.mcp_url == expected
+
+    def test_oauth_token_storage_uses_full_url(self):
+        """Token storage should use the full URL to separate tokens per endpoint."""
+        mcp_url = "https://mcp.example.com/server1/v1.0/mcp"
+        oauth = OAuth(mcp_url=mcp_url)
+
+        # Token storage should key by the full URL, not just the host
+        assert oauth.token_storage_adapter._server_url == mcp_url

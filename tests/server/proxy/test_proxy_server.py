@@ -6,6 +6,7 @@ import pytest
 from anyio import create_task_group
 from dirty_equals import Contains
 from mcp import McpError
+from mcp.types import Icon
 from pydantic import AnyUrl
 
 from fastmcp import FastMCP
@@ -13,6 +14,7 @@ from fastmcp.client import Client
 from fastmcp.client.transports import FastMCPTransport, StreamableHttpTransport
 from fastmcp.exceptions import ToolError
 from fastmcp.server.proxy import FastMCPProxy, ProxyClient
+from fastmcp.tools.tool import ToolResult
 from fastmcp.tools.tool_transform import (
     ToolTransformConfig,
 )
@@ -30,7 +32,11 @@ def fastmcp_server():
 
     # --- Tools ---
 
-    @server.tool(tags={"greet"})
+    @server.tool(
+        tags={"greet"},
+        title="Greet",
+        icons=[Icon(src="https://example.com/greet-icon.png")],
+    )
     def greet(name: str) -> str:
         """Greet someone by name."""
         return f"Hello, {name}!"
@@ -51,7 +57,12 @@ def fastmcp_server():
 
     # --- Resources ---
 
-    @server.resource(uri="resource://wave", tags={"wave"})
+    @server.resource(
+        uri="resource://wave",
+        tags={"wave"},
+        title="Wave",
+        icons=[Icon(src="https://example.com/wave-icon.png")],
+    )
     def wave() -> str:
         return "👋"
 
@@ -59,13 +70,22 @@ def fastmcp_server():
     async def get_users() -> list[dict[str, Any]]:
         return USERS
 
-    @server.resource(uri="data://user/{user_id}", tags={"users"})
+    @server.resource(
+        uri="data://user/{user_id}",
+        tags={"users"},
+        title="User Template",
+        icons=[Icon(src="https://example.com/user-icon.png")],
+    )
     async def get_user(user_id: str) -> dict[str, Any] | None:
         return next((user for user in USERS if user["id"] == user_id), None)
 
     # --- Prompts ---
 
-    @server.prompt(tags={"welcome"})
+    @server.prompt(
+        tags={"welcome"},
+        title="Welcome",
+        icons=[Icon(src="https://example.com/welcome-icon.png")],
+    )
     def welcome(name: str) -> str:
         return f"Welcome to FastMCP, {name}!"
 
@@ -124,7 +144,7 @@ async def test_proxy_with_async_client_factory():
     proxy = FastMCPProxy(client_factory=async_factory)
     assert isinstance(proxy, FastMCPProxy)
     assert inspect.iscoroutinefunction(proxy.client_factory)
-    client = await proxy.client_factory()
+    client = await proxy.client_factory()  # type: ignore[misc]
     assert isinstance(client, Client)
     assert isinstance(client.transport, StreamableHttpTransport)
     assert client.transport.url == "http://example.com/mcp/"  # type: ignore[attr-defined]
@@ -141,7 +161,9 @@ class TestTools:
     async def test_get_tools_meta(self, proxy_server):
         tools = await proxy_server.get_tools()
         greet_tool = tools["greet"]
+        assert greet_tool.title == "Greet"
         assert greet_tool.meta == {"_fastmcp": {"tags": ["greet"]}}
+        assert greet_tool.icons == [Icon(src="https://example.com/greet-icon.png")]
 
     async def test_get_transformed_tools(
         self, fastmcp_server: FastMCP, proxy_server: FastMCPProxy
@@ -173,15 +195,15 @@ class TestTools:
 
     async def test_list_tools_same_as_original(self, fastmcp_server, proxy_server):
         assert (
-            await proxy_server._mcp_list_tools()
-            == await fastmcp_server._mcp_list_tools()
+            await proxy_server._list_tools_mcp()
+            == await fastmcp_server._list_tools_mcp()
         )
 
     async def test_call_tool_result_same_as_original(
         self, fastmcp_server: FastMCP, proxy_server: FastMCPProxy
     ):
-        result = await fastmcp_server._mcp_call_tool("greet", {"name": "Alice"})
-        proxy_result = await proxy_server._mcp_call_tool("greet", {"name": "Alice"})
+        result = await fastmcp_server._call_tool_mcp("greet", {"name": "Alice"})
+        proxy_result = await proxy_server._call_tool_mcp("greet", {"name": "Alice"})
 
         assert result == proxy_result
 
@@ -194,6 +216,23 @@ class TestTools:
         with pytest.raises(ToolError, match="This is a test error"):
             async with Client(proxy_server) as client:
                 await client.call_tool("error_tool", {})
+
+    async def test_call_tool_forwards_meta(self, fastmcp_server, proxy_server):
+        """Test that metadata from proxied tool results is properly forwarded."""
+
+        @fastmcp_server.tool
+        def tool_with_meta(value: str) -> ToolResult:
+            """A tool that returns metadata in its result."""
+            return ToolResult(
+                content=f"Result: {value}",
+                meta={"custom_key": "custom_value", "processed": True},
+            )
+
+        async with Client(proxy_server) as client:
+            result = await client.call_tool("tool_with_meta", {"value": "test"})
+
+        assert result.content[0].text == "Result: test"  # type: ignore[attr-defined]
+        assert result.meta == {"custom_key": "custom_value", "processed": True}
 
     async def test_proxy_can_overwrite_proxied_tool(self, proxy_server):
         """
@@ -263,12 +302,14 @@ class TestResources:
     async def test_get_resources_meta(self, proxy_server):
         resources = await proxy_server.get_resources()
         wave_resource = resources["resource://wave"]
+        assert wave_resource.title == "Wave"
         assert wave_resource.meta == {"_fastmcp": {"tags": ["wave"]}}
+        assert wave_resource.icons == [Icon(src="https://example.com/wave-icon.png")]
 
     async def test_list_resources_same_as_original(self, fastmcp_server, proxy_server):
         assert (
-            await proxy_server._mcp_list_resources()
-            == await fastmcp_server._mcp_list_resources()
+            await proxy_server._list_resources_mcp()
+            == await fastmcp_server._list_resources_mcp()
         )
 
     async def test_read_resource(self, proxy_server: FastMCPProxy):
@@ -362,13 +403,17 @@ class TestResourceTemplates:
     async def test_get_resource_templates_meta(self, proxy_server):
         templates = await proxy_server.get_resource_templates()
         get_user_template = templates["data://user/{user_id}"]
+        assert get_user_template.title == "User Template"
         assert get_user_template.meta == {"_fastmcp": {"tags": ["users"]}}
+        assert get_user_template.icons == [
+            Icon(src="https://example.com/user-icon.png")
+        ]
 
     async def test_list_resource_templates_same_as_original(
         self, fastmcp_server, proxy_server
     ):
-        result = await fastmcp_server._mcp_list_resource_templates()
-        proxy_result = await proxy_server._mcp_list_resource_templates()
+        result = await fastmcp_server._list_resource_templates_mcp()
+        proxy_result = await proxy_server._list_resource_templates_mcp()
         assert proxy_result == result
 
     @pytest.mark.parametrize("id", [1, 2, 3])
@@ -466,7 +511,11 @@ class TestPrompts:
     async def test_get_prompts_meta(self, proxy_server):
         prompts = await proxy_server.get_prompts()
         welcome_prompt = prompts["welcome"]
+        assert welcome_prompt.title == "Welcome"
         assert welcome_prompt.meta == {"_fastmcp": {"tags": ["welcome"]}}
+        assert welcome_prompt.icons == [
+            Icon(src="https://example.com/welcome-icon.png")
+        ]
 
     async def test_list_prompts_same_as_original(self, fastmcp_server, proxy_server):
         async with Client(fastmcp_server) as client:

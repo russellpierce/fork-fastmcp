@@ -1,5 +1,6 @@
 import base64
 import datetime
+import functools
 import json
 import uuid
 from dataclasses import dataclass
@@ -604,12 +605,12 @@ class TestToolParameters:
         async with Client(mcp) as client:
             with pytest.raises(
                 ToolError,
-                match="Input validation error: 'not an int' is not of type 'integer'",
+                match="Input should be a valid integer",
             ):
                 await client.call_tool("my_tool", {"x": "not an int"})
 
     async def test_tool_int_coercion(self):
-        """Test that invalid int input raises validation error."""
+        """Test that string ints are coerced by default."""
         mcp = FastMCP()
 
         @mcp.tool
@@ -617,15 +618,12 @@ class TestToolParameters:
             return x + 1
 
         async with Client(mcp) as client:
-            # String input should raise validation error (no coercion)
-            with pytest.raises(
-                ToolError,
-                match="Input validation error: '42' is not of type 'integer'",
-            ):
-                await client.call_tool("add_one", {"x": "42"})
+            # String input should be coerced with default settings
+            result = await client.call_tool("add_one", {"x": "42"})
+            assert result.data == 43
 
     async def test_tool_bool_coercion(self):
-        """Test that invalid bool input raises validation error."""
+        """Test that string bools are coerced by default."""
         mcp = FastMCP()
 
         @mcp.tool
@@ -633,18 +631,12 @@ class TestToolParameters:
             return not flag
 
         async with Client(mcp) as client:
-            # String input should raise validation error (no coercion)
-            with pytest.raises(
-                ToolError,
-                match="Input validation error: 'true' is not of type 'boolean'",
-            ):
-                await client.call_tool("toggle", {"flag": "true"})
+            # String input should be coerced with default settings
+            result = await client.call_tool("toggle", {"flag": "true"})
+            assert result.data is False
 
-            with pytest.raises(
-                ToolError,
-                match="Input validation error: 'false' is not of type 'boolean'",
-            ):
-                await client.call_tool("toggle", {"flag": "false"})
+            result = await client.call_tool("toggle", {"flag": "false"})
+            assert result.data is True
 
     async def test_annotated_field_validation(self):
         mcp = FastMCP()
@@ -656,7 +648,7 @@ class TestToolParameters:
         async with Client(mcp) as client:
             with pytest.raises(
                 ToolError,
-                match="Input validation error: 0 is less than the minimum of 1",
+                match="Input should be greater than or equal to 1",
             ):
                 await client.call_tool("analyze", {"x": 0})
 
@@ -670,7 +662,7 @@ class TestToolParameters:
         async with Client(mcp) as client:
             with pytest.raises(
                 ToolError,
-                match="Input validation error: 0 is less than the minimum of 1",
+                match="Input should be greater than or equal to 1",
             ):
                 await client.call_tool("analyze", {"x": 0})
 
@@ -682,9 +674,7 @@ class TestToolParameters:
             pass
 
         async with Client(mcp) as client:
-            with pytest.raises(
-                ToolError, match="Input validation error: 'x' is a required property"
-            ):
+            with pytest.raises(ToolError, match="Missing required argument"):
                 await client.call_tool("analyze", {})
 
     async def test_literal_type_validation_error(self):
@@ -697,7 +687,7 @@ class TestToolParameters:
         async with Client(mcp) as client:
             with pytest.raises(
                 ToolError,
-                match=r"Input validation error: 'c' is not one of \['a', 'b'\]",
+                match="Input should be 'a' or 'b'",
             ):
                 await client.call_tool("analyze", {"x": "c"})
 
@@ -727,7 +717,7 @@ class TestToolParameters:
         async with Client(mcp) as client:
             with pytest.raises(
                 ToolError,
-                match=r"Input validation error: 'some-color' is not one of \['red', 'green', 'blue'\]",
+                match="Input should be 'red', 'green' or 'blue'",
             ):
                 await client.call_tool("analyze", {"x": "some-color"})
 
@@ -763,7 +753,7 @@ class TestToolParameters:
 
             with pytest.raises(
                 ToolError,
-                match="Input validation error: 'not a number' is not valid under any of the given schemas",
+                match="Input should be a valid",
             ):
                 await client.call_tool("analyze", {"x": "not a number"})
 
@@ -790,9 +780,7 @@ class TestToolParameters:
             return str(path)
 
         async with Client(mcp) as client:
-            with pytest.raises(
-                ToolError, match="Input validation error: 1 is not of type 'string'"
-            ):
+            with pytest.raises(ToolError, match="Input is not a valid path"):
                 await client.call_tool("send_path", {"path": 1})
 
     async def test_uuid_type(self):
@@ -817,7 +805,7 @@ class TestToolParameters:
             return str(x)
 
         async with Client(mcp) as client:
-            with pytest.raises(ToolError, match="Error calling tool 'send_uuid'"):
+            with pytest.raises(ToolError, match="Input should be a valid UUID"):
                 await client.call_tool("send_uuid", {"x": "not a uuid"})
 
     async def test_datetime_type(self):
@@ -854,7 +842,7 @@ class TestToolParameters:
             return x.isoformat()
 
         async with Client(mcp) as client:
-            with pytest.raises(ToolError, match="Error calling tool 'send_datetime'"):
+            with pytest.raises(ToolError, match="Input should be a valid datetime"):
                 await client.call_tool("send_datetime", {"x": "not a datetime"})
 
     async def test_date_type(self):
@@ -893,7 +881,7 @@ class TestToolParameters:
             assert result.data == "1 day, 0:00:00"
 
     async def test_timedelta_type_parse_int(self):
-        """Test that invalid timedelta input raises validation error."""
+        """Test that int input is coerced to timedelta (seconds)."""
         mcp = FastMCP()
 
         @mcp.tool
@@ -901,12 +889,11 @@ class TestToolParameters:
             return str(x)
 
         async with Client(mcp) as client:
-            # Int input should raise validation error (no conversion)
-            with pytest.raises(
-                ToolError,
-                match="Input validation error: 1000 is not of type 'string'",
-            ):
-                await client.call_tool("send_timedelta", {"x": 1000})
+            # Int input should be coerced to timedelta (seconds)
+            result = await client.call_tool("send_timedelta", {"x": 1000})
+            assert (
+                "0:16:40" in result.data or "16:40" in result.data
+            )  # 1000 seconds = 16 minutes 40 seconds
 
     async def test_annotated_string_description(self):
         mcp = FastMCP()
@@ -1193,6 +1180,7 @@ class TestToolOutputSchema:
                             "_meta": None,
                         },
                     ],
+                    meta=None,
                 )
             )
 
@@ -1322,6 +1310,34 @@ class TestToolContextInjection:
         async with Client(mcp) as client:
             result = await client.call_tool("MyTool", {"x": 2})
             assert result.data == 3
+
+    async def test_decorated_tool_with_functools_wraps(self):
+        """Regression test for #2524: @mcp.tool with functools.wraps decorator."""
+
+        def custom_decorator(func):
+            @functools.wraps(func)
+            async def wrapper(*args, **kwargs):
+                return await func(*args, **kwargs)
+
+            return wrapper
+
+        mcp = FastMCP()
+
+        @mcp.tool
+        @custom_decorator
+        async def decorated_tool(ctx: Context, query: str) -> str:
+            assert isinstance(ctx, Context)
+            return f"query: {query}"
+
+        async with Client(mcp) as client:
+            # Verify ctx is not in the schema
+            tools = await client.list_tools()
+            tool = next(t for t in tools if t.name == "decorated_tool")
+            assert "ctx" not in tool.inputSchema.get("properties", {})
+
+            # Verify the tool works
+            result = await client.call_tool("decorated_tool", {"query": "test"})
+            assert result.data == "query: test"
 
 
 class TestToolEnabled:
@@ -1748,7 +1764,7 @@ class TestResourceTemplates:
 
         with pytest.raises(
             ValueError,
-            match="Required function arguments .* must be a subset of the URI parameters",
+            match="Required function arguments .* must be a subset of the URI path parameters",
         ):
 
             @mcp.resource("resource://{name}/data")
@@ -1775,7 +1791,7 @@ class TestResourceTemplates:
 
         with pytest.raises(
             ValueError,
-            match="Required function arguments .* must be a subset of the URI parameters",
+            match="Required function arguments .* must be a subset of the URI path parameters",
         ):
 
             @mcp.resource("resource://{org}/{repo}/data")
@@ -1868,6 +1884,29 @@ class TestResourceTemplates:
         async with Client(mcp) as client:
             result = await client.read_resource(AnyUrl("resource://test/data"))
             assert result[0].text == "Template resource: test/data"  # type: ignore[attr-defined]
+
+    async def test_template_with_query_params(self):
+        """Test RFC 6570 query parameters in resource templates."""
+        mcp = FastMCP()
+
+        @mcp.resource("data://{id}{?format,limit}")
+        def get_data(id: str, format: str = "json", limit: int = 10) -> str:
+            return f"id={id}, format={format}, limit={limit}"
+
+        async with Client(mcp) as client:
+            # No query params - uses defaults
+            result = await client.read_resource(AnyUrl("data://123"))
+            assert result[0].text == "id=123, format=json, limit=10"  # type: ignore[attr-defined]
+
+            # One query param
+            result = await client.read_resource(AnyUrl("data://123?format=xml"))
+            assert result[0].text == "id=123, format=xml, limit=10"  # type: ignore[attr-defined]
+
+            # Multiple query params
+            result = await client.read_resource(
+                AnyUrl("data://123?format=csv&limit=50")
+            )
+            assert result[0].text == "id=123, format=csv, limit=50"  # type: ignore[attr-defined]
 
     async def test_templates_match_in_order_of_definition(self):
         """

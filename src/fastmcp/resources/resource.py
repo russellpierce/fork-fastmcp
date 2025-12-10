@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import abc
 import inspect
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Any
 
 import pydantic_core
-from mcp.types import Annotations
+from mcp.types import Annotations, Icon
 from mcp.types import Resource as MCPResource
 from pydantic import (
     AnyUrl,
@@ -20,10 +19,10 @@ from pydantic import (
 )
 from typing_extensions import Self
 
-from fastmcp.server.dependencies import get_context
+from fastmcp.server.dependencies import get_context, without_injected_parameters
+from fastmcp.server.tasks.config import TaskConfig
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.types import (
-    find_kwarg_by_type,
     get_fn_name,
 )
 
@@ -31,7 +30,7 @@ if TYPE_CHECKING:
     pass
 
 
-class Resource(FastMCPComponent, abc.ABC):
+class Resource(FastMCPComponent):
     """Base class for all resources."""
 
     model_config = ConfigDict(validate_default=True)
@@ -43,7 +42,6 @@ class Resource(FastMCPComponent, abc.ABC):
     mime_type: str = Field(
         default="text/plain",
         description="MIME type of the resource content",
-        pattern=r"^[a-zA-Z0-9]+/[a-zA-Z0-9\-+.]+$",
     )
     annotations: Annotated[
         Annotations | None,
@@ -73,11 +71,13 @@ class Resource(FastMCPComponent, abc.ABC):
         name: str | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[Icon] | None = None,
         mime_type: str | None = None,
         tags: set[str] | None = None,
         enabled: bool | None = None,
         annotations: Annotations | None = None,
         meta: dict[str, Any] | None = None,
+        task: bool | TaskConfig | None = None,
     ) -> FunctionResource:
         return FunctionResource.from_function(
             fn=fn,
@@ -85,11 +85,13 @@ class Resource(FastMCPComponent, abc.ABC):
             name=name,
             title=title,
             description=description,
+            icons=icons,
             mime_type=mime_type,
             tags=tags,
             enabled=enabled,
             annotations=annotations,
             meta=meta,
+            task=task,
         )
 
     @field_validator("mime_type", mode="before")
@@ -111,10 +113,13 @@ class Resource(FastMCPComponent, abc.ABC):
             raise ValueError("Either name or uri must be provided")
         return self
 
-    @abc.abstractmethod
     async def read(self) -> str | bytes:
-        """Read the resource content."""
-        pass
+        """Read the resource content.
+
+        This method is not implemented in the base Resource class and must be
+        implemented by subclasses.
+        """
+        raise NotImplementedError("Subclasses must implement read()")
 
     def to_mcp_resource(
         self,
@@ -130,6 +135,7 @@ class Resource(FastMCPComponent, abc.ABC):
             description=overrides.get("description", self.description),
             mimeType=overrides.get("mimeType", self.mime_type),
             title=overrides.get("title", self.title),
+            icons=overrides.get("icons", self.icons),
             annotations=overrides.get("annotations", self.annotations),
             _meta=overrides.get(
                 "_meta", self.get_meta(include_fastmcp_meta=include_fastmcp_meta)
@@ -164,6 +170,10 @@ class FunctionResource(Resource):
     """
 
     fn: Callable[..., Any]
+    task_config: Annotated[
+        TaskConfig,
+        Field(description="Background task execution configuration (SEP-1686)."),
+    ] = Field(default_factory=lambda: TaskConfig(mode="forbidden"))
 
     @classmethod
     def from_function(
@@ -173,46 +183,58 @@ class FunctionResource(Resource):
         name: str | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[Icon] | None = None,
         mime_type: str | None = None,
         tags: set[str] | None = None,
         enabled: bool | None = None,
         annotations: Annotations | None = None,
         meta: dict[str, Any] | None = None,
+        task: bool | TaskConfig | None = None,
     ) -> FunctionResource:
         """Create a FunctionResource from a function."""
         if isinstance(uri, str):
             uri = AnyUrl(uri)
+
+        func_name = name or get_fn_name(fn)
+
+        # Normalize task to TaskConfig and validate
+        if task is None:
+            task_config = TaskConfig(mode="forbidden")
+        elif isinstance(task, bool):
+            task_config = TaskConfig.from_bool(task)
+        else:
+            task_config = task
+        task_config.validate_function(fn, func_name)
+
+        # Wrap fn to handle dependency resolution internally
+        wrapped_fn = without_injected_parameters(fn)
+
         return cls(
-            fn=fn,
+            fn=wrapped_fn,
             uri=uri,
             name=name or get_fn_name(fn),
             title=title,
             description=description or inspect.getdoc(fn),
+            icons=icons,
             mime_type=mime_type or "text/plain",
             tags=tags or set(),
             enabled=enabled if enabled is not None else True,
             annotations=annotations,
             meta=meta,
+            task_config=task_config,
         )
 
     async def read(self) -> str | bytes:
         """Read the resource by calling the wrapped function."""
-        from fastmcp.server.context import Context
-
-        kwargs = {}
-        context_kwarg = find_kwarg_by_type(self.fn, kwarg_type=Context)
-        if context_kwarg is not None:
-            kwargs[context_kwarg] = get_context()
-
-        result = self.fn(**kwargs)
+        # self.fn is wrapped by without_injected_parameters which handles
+        # dependency resolution internally
+        result = self.fn()
         if inspect.isawaitable(result):
             result = await result
 
         if isinstance(result, Resource):
             return await result.read()
-        elif isinstance(result, bytes):
-            return result
-        elif isinstance(result, str):
+        elif isinstance(result, bytes | str):
             return result
         else:
             return pydantic_core.to_json(result, fallback=str).decode()

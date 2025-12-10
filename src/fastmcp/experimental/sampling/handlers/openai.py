@@ -21,10 +21,10 @@ try:
         ChatCompletionUserMessageParam,
     )
     from openai.types.shared.chat_model import ChatModel
-except ImportError:
+except ImportError as e:
     raise ImportError(
         "The `openai` package is not installed. Please install `fastmcp[openai]` or add `openai` to your dependencies manually."
-    )
+    ) from e
 
 from typing_extensions import override
 
@@ -164,7 +164,7 @@ class OpenAISamplingHandler(BaseLLMSamplingHandler):
     ) -> ChatModel:
         for model_option in self._iter_models_from_preferences(model_preferences):
             if model_option in get_args(ChatModel):
-                chosen_model: ChatModel = model_option  # pyright: ignore[reportAssignmentType]
+                chosen_model: ChatModel = model_option  # type: ignore[assignment]
                 return chosen_model
 
         return self.default_model

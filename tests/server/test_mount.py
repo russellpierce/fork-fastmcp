@@ -66,22 +66,6 @@ class TestBasicMount:
             result = await client.call_tool("sub_greet", {"name": "World"})
             assert result.data == "Hello, World!"
 
-    async def test_mount_invalid_resource_prefix(self):
-        main_app = FastMCP("MainApp")
-        api_app = FastMCP("APIApp")
-
-        # This test doesn't apply anymore with the new prefix format
-        # just mount the server to maintain test coverage
-        main_app.mount(api_app, "api:sub")
-
-    async def test_mount_invalid_resource_separator(self):
-        main_app = FastMCP("MainApp")
-        api_app = FastMCP("APIApp")
-
-        # This test doesn't apply anymore with the new prefix format
-        # Mount without deprecated parameters
-        main_app.mount(api_app, "api")
-
     @pytest.mark.parametrize("prefix", ["", None])
     async def test_mount_with_no_prefix(self, prefix):
         main_app = FastMCP("MainApp")
@@ -329,18 +313,15 @@ class TestMultipleServerMount:
             record.message for record in caplog.records if record.levelname == "WARNING"
         ]
         assert any(
-            "Failed to get tools from server: 'unreachable_proxy', mounted at: 'unreachable'"
-            in msg
+            "Failed to list tools from mounted server 'unreachable_proxy'" in msg
             for msg in warning_messages
         )
         assert any(
-            "Failed to get resources from server: 'unreachable_proxy', mounted at: 'unreachable'"
-            in msg
+            "Failed to list resources from 'unreachable_proxy'" in msg
             for msg in warning_messages
         )
         assert any(
-            "Failed to get prompts from server: 'unreachable_proxy', mounted at: 'unreachable'"
-            in msg
+            "Failed to list prompts from mounted server 'unreachable_proxy'" in msg
             for msg in warning_messages
         )
 
@@ -871,7 +852,7 @@ class TestAsProxyKwarg:
         sub = FastMCP("Sub")
 
         mcp.mount(sub, "sub")
-        assert mcp._tool_manager._mounted_servers[0].server is sub
+        assert mcp._mounted_servers[0].server is sub
 
     async def test_as_proxy_false(self):
         mcp = FastMCP("Main")
@@ -879,7 +860,7 @@ class TestAsProxyKwarg:
 
         mcp.mount(sub, "sub", as_proxy=False)
 
-        assert mcp._tool_manager._mounted_servers[0].server is sub
+        assert mcp._mounted_servers[0].server is sub
 
     async def test_as_proxy_true(self):
         mcp = FastMCP("Main")
@@ -887,21 +868,24 @@ class TestAsProxyKwarg:
 
         mcp.mount(sub, "sub", as_proxy=True)
 
-        assert mcp._tool_manager._mounted_servers[0].server is not sub
-        assert isinstance(mcp._tool_manager._mounted_servers[0].server, FastMCPProxy)
+        assert mcp._mounted_servers[0].server is not sub
+        assert isinstance(mcp._mounted_servers[0].server, FastMCPProxy)
 
     async def test_as_proxy_defaults_true_if_lifespan(self):
+        """Test that as_proxy defaults to True when server_lifespan is provided."""
+
         @asynccontextmanager
-        async def lifespan(mcp: FastMCP):
+        async def server_lifespan(mcp: FastMCP):
             yield
 
         mcp = FastMCP("Main")
-        sub = FastMCP("Sub", lifespan=lifespan)
+        sub = FastMCP("Sub", lifespan=server_lifespan)
 
         mcp.mount(sub, "sub")
 
-        assert mcp._tool_manager._mounted_servers[0].server is not sub
-        assert isinstance(mcp._tool_manager._mounted_servers[0].server, FastMCPProxy)
+        # Should auto-proxy because lifespan is set
+        assert mcp._mounted_servers[0].server is not sub
+        assert isinstance(mcp._mounted_servers[0].server, FastMCPProxy)
 
     async def test_as_proxy_ignored_for_proxy_mounts_default(self):
         mcp = FastMCP("Main")
@@ -910,7 +894,7 @@ class TestAsProxyKwarg:
 
         mcp.mount(sub_proxy, "sub")
 
-        assert mcp._tool_manager._mounted_servers[0].server is sub_proxy
+        assert mcp._mounted_servers[0].server is sub_proxy
 
     async def test_as_proxy_ignored_for_proxy_mounts_false(self):
         mcp = FastMCP("Main")
@@ -919,7 +903,7 @@ class TestAsProxyKwarg:
 
         mcp.mount(sub_proxy, "sub", as_proxy=False)
 
-        assert mcp._tool_manager._mounted_servers[0].server is sub_proxy
+        assert mcp._mounted_servers[0].server is sub_proxy
 
     async def test_as_proxy_ignored_for_proxy_mounts_true(self):
         mcp = FastMCP("Main")
@@ -928,7 +912,7 @@ class TestAsProxyKwarg:
 
         mcp.mount(sub_proxy, "sub", as_proxy=True)
 
-        assert mcp._tool_manager._mounted_servers[0].server is sub_proxy
+        assert mcp._mounted_servers[0].server is sub_proxy
 
     async def test_as_proxy_mounts_still_have_live_link(self):
         mcp = FastMCP("Main")
@@ -966,10 +950,8 @@ class TestAsProxyKwarg:
         async with Client(mcp) as client:
             await client.call_tool("hello", {})
 
-        assert len(lifespan_check) > 0
-        # in the present implementation the sub server will be invoked 3 times
-        # to call its tool
-        assert lifespan_check.count("start") >= 2
+        # Lifespan is entered exactly once and kept alive by Docket worker
+        assert lifespan_check == ["start"]
 
 
 class TestResourceNamePrefixing:
@@ -1022,6 +1004,101 @@ class TestResourceNamePrefixing:
         # The template name should also be prefixed
         template = templates["resource://prefix/user/{user_id}"]
         assert template.name == "prefix_user_template"
+
+
+class TestParentTagFiltering:
+    """Test that parent server tag filters apply recursively to mounted servers."""
+
+    async def test_parent_include_tags_filters_mounted_tools(self):
+        """Test that parent include_tags filters out non-matching mounted tools."""
+        parent = FastMCP("Parent", include_tags={"allowed"})
+        mounted = FastMCP("Mounted")
+
+        @mounted.tool(tags={"allowed"})
+        def allowed_tool() -> str:
+            return "allowed"
+
+        @mounted.tool(tags={"blocked"})
+        def blocked_tool() -> str:
+            return "blocked"
+
+        parent.mount(mounted)
+
+        async with Client(parent) as client:
+            tools = await client.list_tools()
+            tool_names = {t.name for t in tools}
+            assert "allowed_tool" in tool_names
+            assert "blocked_tool" not in tool_names
+
+            # Verify execution also respects filters
+            result = await client.call_tool("allowed_tool", {})
+            assert result.data == "allowed"
+
+            with pytest.raises(Exception, match="Unknown tool"):
+                await client.call_tool("blocked_tool", {})
+
+    async def test_parent_exclude_tags_filters_mounted_tools(self):
+        """Test that parent exclude_tags filters out matching mounted tools."""
+        parent = FastMCP("Parent", exclude_tags={"blocked"})
+        mounted = FastMCP("Mounted")
+
+        @mounted.tool(tags={"production"})
+        def production_tool() -> str:
+            return "production"
+
+        @mounted.tool(tags={"blocked"})
+        def blocked_tool() -> str:
+            return "blocked"
+
+        parent.mount(mounted)
+
+        async with Client(parent) as client:
+            tools = await client.list_tools()
+            tool_names = {t.name for t in tools}
+            assert "production_tool" in tool_names
+            assert "blocked_tool" not in tool_names
+
+    async def test_parent_filters_apply_to_mounted_resources(self):
+        """Test that parent tag filters apply to mounted resources."""
+        parent = FastMCP("Parent", include_tags={"allowed"})
+        mounted = FastMCP("Mounted")
+
+        @mounted.resource("resource://allowed", tags={"allowed"})
+        def allowed_resource() -> str:
+            return "allowed"
+
+        @mounted.resource("resource://blocked", tags={"blocked"})
+        def blocked_resource() -> str:
+            return "blocked"
+
+        parent.mount(mounted)
+
+        async with Client(parent) as client:
+            resources = await client.list_resources()
+            resource_uris = {str(r.uri) for r in resources}
+            assert "resource://allowed" in resource_uris
+            assert "resource://blocked" not in resource_uris
+
+    async def test_parent_filters_apply_to_mounted_prompts(self):
+        """Test that parent tag filters apply to mounted prompts."""
+        parent = FastMCP("Parent", exclude_tags={"blocked"})
+        mounted = FastMCP("Mounted")
+
+        @mounted.prompt(tags={"allowed"})
+        def allowed_prompt() -> str:
+            return "allowed"
+
+        @mounted.prompt(tags={"blocked"})
+        def blocked_prompt() -> str:
+            return "blocked"
+
+        parent.mount(mounted)
+
+        async with Client(parent) as client:
+            prompts = await client.list_prompts()
+            prompt_names = {p.name for p in prompts}
+            assert "allowed_prompt" in prompt_names
+            assert "blocked_prompt" not in prompt_names
 
 
 class TestCustomRouteForwarding:
@@ -1144,3 +1221,143 @@ class TestCustomRouteForwarding:
         route_paths = [route.path for route in routes]  # type: ignore[attr-defined]
         assert "/route1" in route_paths
         assert "/route2" in route_paths
+
+
+class TestDeeplyNestedMount:
+    """Test deeply nested mount scenarios (3+ levels deep).
+
+    This tests the fix for https://github.com/jlowin/fastmcp/issues/2583
+    where tools/resources/prompts mounted more than 2 levels deep would fail
+    to invoke even though they were correctly listed.
+    """
+
+    async def test_three_level_nested_tool_invocation(self):
+        """Test invoking tools from servers mounted 3 levels deep."""
+        root = FastMCP("root")
+        middle = FastMCP("middle")
+        leaf = FastMCP("leaf")
+
+        @leaf.tool
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        @middle.tool
+        def multiply(a: int, b: int) -> int:
+            return a * b
+
+        middle.mount(leaf, prefix="leaf")
+        root.mount(middle, prefix="middle")
+
+        async with Client(root) as client:
+            # Tool at level 2 should work
+            result = await client.call_tool("middle_multiply", {"a": 3, "b": 4})
+            assert result.data == 12
+
+            # Tool at level 3 should also work (this was the bug)
+            result = await client.call_tool("middle_leaf_add", {"a": 5, "b": 7})
+            assert result.data == 12
+
+    async def test_three_level_nested_resource_invocation(self):
+        """Test reading resources from servers mounted 3 levels deep."""
+        root = FastMCP("root")
+        middle = FastMCP("middle")
+        leaf = FastMCP("leaf")
+
+        @leaf.resource("leaf://data")
+        def leaf_data() -> str:
+            return "leaf data"
+
+        @middle.resource("middle://data")
+        def middle_data() -> str:
+            return "middle data"
+
+        middle.mount(leaf, prefix="leaf")
+        root.mount(middle, prefix="middle")
+
+        async with Client(root) as client:
+            # Resource at level 2 should work
+            result = await client.read_resource("middle://middle/data")
+            assert result[0].text == "middle data"
+
+            # Resource at level 3 should also work
+            result = await client.read_resource("leaf://middle/leaf/data")
+            assert result[0].text == "leaf data"
+
+    async def test_three_level_nested_resource_template_invocation(self):
+        """Test reading resource templates from servers mounted 3 levels deep."""
+        root = FastMCP("root")
+        middle = FastMCP("middle")
+        leaf = FastMCP("leaf")
+
+        @leaf.resource("leaf://item/{id}")
+        def leaf_item(id: str) -> str:
+            return f"leaf item {id}"
+
+        @middle.resource("middle://item/{id}")
+        def middle_item(id: str) -> str:
+            return f"middle item {id}"
+
+        middle.mount(leaf, prefix="leaf")
+        root.mount(middle, prefix="middle")
+
+        async with Client(root) as client:
+            # Resource template at level 2 should work
+            result = await client.read_resource("middle://middle/item/42")
+            assert result[0].text == "middle item 42"
+
+            # Resource template at level 3 should also work
+            result = await client.read_resource("leaf://middle/leaf/item/99")
+            assert result[0].text == "leaf item 99"
+
+    async def test_three_level_nested_prompt_invocation(self):
+        """Test getting prompts from servers mounted 3 levels deep."""
+        root = FastMCP("root")
+        middle = FastMCP("middle")
+        leaf = FastMCP("leaf")
+
+        @leaf.prompt
+        def leaf_prompt(name: str) -> str:
+            return f"Hello from leaf: {name}"
+
+        @middle.prompt
+        def middle_prompt(name: str) -> str:
+            return f"Hello from middle: {name}"
+
+        middle.mount(leaf, prefix="leaf")
+        root.mount(middle, prefix="middle")
+
+        async with Client(root) as client:
+            # Prompt at level 2 should work
+            result = await client.get_prompt("middle_middle_prompt", {"name": "World"})
+            assert "Hello from middle: World" in result.messages[0].content.text  # type: ignore[union-attr]
+
+            # Prompt at level 3 should also work
+            result = await client.get_prompt(
+                "middle_leaf_leaf_prompt", {"name": "Test"}
+            )
+            assert "Hello from leaf: Test" in result.messages[0].content.text  # type: ignore[union-attr]
+
+    async def test_four_level_nested_tool_invocation(self):
+        """Test invoking tools from servers mounted 4 levels deep."""
+        root = FastMCP("root")
+        level1 = FastMCP("level1")
+        level2 = FastMCP("level2")
+        level3 = FastMCP("level3")
+
+        @level3.tool
+        def deep_tool() -> str:
+            return "very deep"
+
+        level2.mount(level3, prefix="l3")
+        level1.mount(level2, prefix="l2")
+        root.mount(level1, prefix="l1")
+
+        async with Client(root) as client:
+            # Verify tool is listed
+            tools = await client.list_tools()
+            tool_names = [t.name for t in tools]
+            assert "l1_l2_l3_deep_tool" in tool_names
+
+            # Tool at level 4 should work
+            result = await client.call_tool("l1_l2_l3_deep_tool", {})
+            assert result.data == "very deep"

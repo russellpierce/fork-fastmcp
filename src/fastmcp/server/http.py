@@ -5,10 +5,12 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
-from mcp.server.auth.middleware.bearer_auth import RequireAuthMiddleware
+from mcp.server.auth.routes import build_resource_metadata_url
 from mcp.server.lowlevel.server import LifespanResultT
 from mcp.server.sse import SseServerTransport
-from mcp.server.streamable_http import EventStore
+from mcp.server.streamable_http import (
+    EventStore,
+)
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -18,6 +20,8 @@ from starlette.routing import BaseRoute, Mount, Route
 from starlette.types import Lifespan, Receive, Scope, Send
 
 from fastmcp.server.auth import AuthProvider
+from fastmcp.server.auth.middleware import RequireAuthMiddleware
+from fastmcp.server.tasks.capabilities import get_task_capabilities
 from fastmcp.utilities.logging import get_logger
 
 if TYPE_CHECKING:
@@ -113,7 +117,8 @@ def create_base_app(
         A Starlette application
     """
     # Always add RequestContextMiddleware as the outermost middleware
-    middleware.insert(0, Middleware(RequestContextMiddleware))
+    # TODO(ty): remove type ignore when ty supports Starlette Middleware typing
+    middleware.insert(0, Middleware(RequestContextMiddleware))  # type: ignore[arg-type]
 
     return StarletteWithLifespan(
         routes=routes,
@@ -155,10 +160,15 @@ def create_sse_app(
     # Create handler for SSE connections
     async def handle_sse(scope: Scope, receive: Receive, send: Send) -> Response:
         async with sse.connect_sse(scope, receive, send) as streams:
+            # Build experimental capabilities
+            experimental_capabilities = get_task_capabilities()
+
             await server._mcp_server.run(
                 streams[0],
                 streams[1],
-                server._mcp_server.create_initialization_options(),
+                server._mcp_server.create_initialization_options(
+                    experimental_capabilities=experimental_capabilities
+                ),
             )
         return Response()
 
@@ -172,14 +182,20 @@ def create_sse_app(
         server_routes.extend(auth_routes)
         server_middleware.extend(auth_middleware)
 
-        # Create protected SSE endpoint route with GET method only
+        # Build RFC 9728-compliant metadata URL
+        resource_url = auth._get_resource_url(sse_path)
+        resource_metadata_url = (
+            build_resource_metadata_url(resource_url) if resource_url else None
+        )
+
+        # Create protected SSE endpoint route
         server_routes.append(
             Route(
                 sse_path,
                 endpoint=RequireAuthMiddleware(
                     handle_sse,
                     auth.required_scopes,
-                    auth._get_resource_url("/.well-known/oauth-protected-resource"),
+                    resource_metadata_url,
                 ),
                 methods=["GET"],
             )
@@ -192,7 +208,7 @@ def create_sse_app(
                 app=RequireAuthMiddleware(
                     sse.handle_post_message,
                     auth.required_scopes,
-                    auth._get_resource_url("/.well-known/oauth-protected-resource"),
+                    resource_metadata_url,
                 ),
             )
         )
@@ -224,11 +240,17 @@ def create_sse_app(
     if middleware:
         server_middleware.extend(middleware)
 
+    @asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
+        async with server._lifespan_manager():
+            yield
+
     # Create and return the app
     app = create_base_app(
         routes=server_routes,
         middleware=server_middleware,
         debug=debug,
+        lifespan=lifespan,
     )
     # Store the FastMCP server instance on the Starlette app state
     app.state.fastmcp_server = server
@@ -241,6 +263,7 @@ def create_streamable_http_app(
     server: FastMCP[LifespanResultT],
     streamable_http_path: str,
     event_store: EventStore | None = None,
+    retry_interval: int | None = None,
     auth: AuthProvider | None = None,
     json_response: bool = False,
     stateless_http: bool = False,
@@ -253,7 +276,10 @@ def create_streamable_http_app(
     Args:
         server: The FastMCP server instance
         streamable_http_path: Path for StreamableHTTP connections
-        event_store: Optional event store for session management
+        event_store: Optional event store for SSE polling/resumability
+        retry_interval: Optional retry interval in milliseconds for SSE polling.
+            Controls how quickly clients should reconnect after server-initiated
+            disconnections. Requires event_store to be set. Defaults to SDK default.
         auth: Optional authentication provider (AuthProvider)
         json_response: Whether to use JSON response format
         stateless_http: Whether to use stateless mode (new transport per request)
@@ -271,6 +297,7 @@ def create_streamable_http_app(
     session_manager = StreamableHTTPSessionManager(
         app=server._mcp_server,
         event_store=event_store,
+        retry_interval=retry_interval,
         json_response=json_response,
         stateless=stateless_http,
     )
@@ -288,6 +315,12 @@ def create_streamable_http_app(
         server_routes.extend(auth_routes)
         server_middleware.extend(auth_middleware)
 
+        # Build RFC 9728-compliant metadata URL
+        resource_url = auth._get_resource_url(streamable_http_path)
+        resource_metadata_url = (
+            build_resource_metadata_url(resource_url) if resource_url else None
+        )
+
         # Create protected HTTP endpoint route
         server_routes.append(
             Route(
@@ -295,8 +328,9 @@ def create_streamable_http_app(
                 endpoint=RequireAuthMiddleware(
                     streamable_http_app,
                     auth.required_scopes,
-                    auth._get_resource_url("/.well-known/oauth-protected-resource"),
+                    resource_metadata_url,
                 ),
+                methods=["GET", "POST", "DELETE"],
             )
         )
     else:
@@ -320,7 +354,7 @@ def create_streamable_http_app(
     # Create a lifespan manager to start and stop the session manager
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
-        async with session_manager.run():
+        async with server._lifespan_manager(), session_manager.run():
             yield
 
     # Create and return the app with lifespan

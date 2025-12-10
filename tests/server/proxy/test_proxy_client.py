@@ -3,7 +3,13 @@ from typing import cast
 
 import pytest
 from anyio import create_task_group
-from mcp.types import LoggingLevel, ModelHint, ModelPreferences, TextContent
+from mcp.types import (
+    ElicitRequestFormParams,
+    LoggingLevel,
+    ModelHint,
+    ModelPreferences,
+    TextContent,
+)
 from pydantic import BaseModel, Field
 
 from fastmcp import Client, Context, FastMCP
@@ -81,7 +87,7 @@ async def proxy_server(fastmcp_server: FastMCP):
     """
     A proxy server that forwards interactions with the proxy client to the given fastmcp server.
     """
-    return FastMCP.as_proxy(ProxyClient(fastmcp_server))
+    return FastMCP.as_proxy(ProxyClient(fastmcp_server))  # type: ignore
 
 
 class TestProxyClient:
@@ -181,6 +187,7 @@ class TestProxyClient:
             elicitation_handler_called = True
             assert message == "What is your name?"
             assert "Person" in str(response_type)
+            assert isinstance(params, ElicitRequestFormParams)
             assert params.requestedSchema == {
                 "title": "Person",
                 "type": "object",
@@ -367,7 +374,7 @@ class TestProxyClient:
             else:
                 return f"Elicitation {result.action}"
 
-        proxy_server = FastMCP.as_proxy(ProxyClient(fastmcp_server))
+        proxy_server = FastMCP.as_proxy(ProxyClient(fastmcp_server))  # type: ignore
 
         # Test that elicitation works correctly through the proxy
         async def elicitation_handler(
@@ -377,6 +384,7 @@ class TestProxyClient:
             ctx: RequestContext,
         ):
             # Verify the schema is correct - acknowledge should have default=False, not be nullable
+            assert isinstance(params, ElicitRequestFormParams)
             schema = params.requestedSchema
             assert schema["properties"]["acknowledge"]["type"] == "boolean"
             assert schema["properties"]["acknowledge"]["default"] is False

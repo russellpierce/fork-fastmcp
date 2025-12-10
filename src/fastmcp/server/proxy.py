@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import warnings
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -15,12 +14,12 @@ from mcp.shared.exceptions import McpError
 from mcp.types import (
     METHOD_NOT_FOUND,
     BlobResourceContents,
+    ElicitRequestFormParams,
     GetPromptResult,
     TextResourceContents,
 )
 from pydantic.networks import AnyUrl
 
-import fastmcp
 from fastmcp.client.client import Client, FastMCP1Server
 from fastmcp.client.elicitation import ElicitResult
 from fastmcp.client.logging import LogMessage
@@ -36,6 +35,7 @@ from fastmcp.resources.resource_manager import ResourceManager
 from fastmcp.server.context import Context
 from fastmcp.server.dependencies import get_context
 from fastmcp.server.server import FastMCP
+from fastmcp.server.tasks.config import TaskConfig
 from fastmcp.tools.tool import Tool, ToolResult
 from fastmcp.tools.tool_manager import ToolManager
 from fastmcp.tools.tool_transform import (
@@ -69,7 +69,7 @@ class ProxyManagerMixin:
 class ProxyToolManager(ToolManager, ProxyManagerMixin):
     """A ToolManager that sources its tools from a remote client in addition to local and mounted tools."""
 
-    def __init__(self, client_factory: ClientFactoryT, **kwargs):
+    def __init__(self, client_factory: ClientFactoryT, **kwargs: Any):
         super().__init__(**kwargs)
         self.client_factory = client_factory
 
@@ -117,13 +117,14 @@ class ProxyToolManager(ToolManager, ProxyManagerMixin):
                 return ToolResult(
                     content=result.content,
                     structured_content=result.structured_content,
+                    meta=result.meta,
                 )
 
 
 class ProxyResourceManager(ResourceManager, ProxyManagerMixin):
     """A ResourceManager that sources its resources from a remote client in addition to local and mounted resources."""
 
-    def __init__(self, client_factory: ClientFactoryT, **kwargs):
+    def __init__(self, client_factory: ClientFactoryT, **kwargs: Any):
         super().__init__(**kwargs)
         self.client_factory = client_factory
 
@@ -198,13 +199,15 @@ class ProxyResourceManager(ResourceManager, ProxyManagerMixin):
                 elif isinstance(result[0], BlobResourceContents):
                     return result[0].blob
                 else:
-                    raise ResourceError(f"Unsupported content type: {type(result[0])}")
+                    raise ResourceError(
+                        f"Unsupported content type: {type(result[0])}"
+                    ) from None
 
 
 class ProxyPromptManager(PromptManager, ProxyManagerMixin):
     """A PromptManager that sources its prompts from a remote client in addition to local and mounted prompts."""
 
-    def __init__(self, client_factory: ClientFactoryT, **kwargs):
+    def __init__(self, client_factory: ClientFactoryT, **kwargs: Any):
         super().__init__(**kwargs)
         self.client_factory = client_factory
 
@@ -258,7 +261,9 @@ class ProxyTool(Tool, MirroredComponent):
     A Tool that represents and executes a tool on a remote server.
     """
 
-    def __init__(self, client: Client, **kwargs):
+    task_config: TaskConfig = TaskConfig(mode="forbidden")
+
+    def __init__(self, client: Client, **kwargs: Any):
         super().__init__(**kwargs)
         self._client = client
 
@@ -268,10 +273,12 @@ class ProxyTool(Tool, MirroredComponent):
         return cls(
             client=client,
             name=mcp_tool.name,
+            title=mcp_tool.title,
             description=mcp_tool.description,
             parameters=mcp_tool.inputSchema,
             annotations=mcp_tool.annotations,
             output_schema=mcp_tool.outputSchema,
+            icons=mcp_tool.icons,
             meta=mcp_tool.meta,
             tags=(mcp_tool.meta or {}).get("_fastmcp", {}).get("tags", []),
             _mirrored=True,
@@ -284,15 +291,37 @@ class ProxyTool(Tool, MirroredComponent):
     ) -> ToolResult:
         """Executes the tool by making a call through the client."""
         async with self._client:
+            context = get_context()
+            # Build meta dict from request context
+            meta: dict[str, Any] | None = None
+            if hasattr(context, "request_context"):
+                req_ctx = context.request_context
+                # Start with existing meta if present
+                if hasattr(req_ctx, "meta") and req_ctx.meta:
+                    meta = dict(req_ctx.meta)
+                # Add task metadata if this is a task request
+                if (
+                    hasattr(req_ctx, "experimental")
+                    and hasattr(req_ctx.experimental, "is_task")
+                    and req_ctx.experimental.is_task
+                ):
+                    task_metadata = req_ctx.experimental.task_metadata
+                    if task_metadata:
+                        meta = meta or {}
+                        meta["modelcontextprotocol.io/task"] = task_metadata.model_dump(
+                            exclude_none=True
+                        )
+
             result = await self._client.call_tool_mcp(
-                name=self.name,
-                arguments=arguments,
+                name=self.name, arguments=arguments, meta=meta
             )
         if result.isError:
             raise ToolError(cast(mcp.types.TextContent, result.content[0]).text)
+        # Preserve backend's meta (includes task metadata for background tasks)
         return ToolResult(
             content=result.content,
             structured_content=result.structuredContent,
+            meta=result.meta,
         )
 
 
@@ -301,6 +330,7 @@ class ProxyResource(Resource, MirroredComponent):
     A Resource that represents and reads a resource from a remote server.
     """
 
+    task_config: TaskConfig = TaskConfig(mode="forbidden")
     _client: Client
     _value: str | bytes | None = None
 
@@ -327,10 +357,13 @@ class ProxyResource(Resource, MirroredComponent):
             client=client,
             uri=mcp_resource.uri,
             name=mcp_resource.name,
+            title=mcp_resource.title,
             description=mcp_resource.description,
             mime_type=mcp_resource.mimeType or "text/plain",
+            icons=mcp_resource.icons,
             meta=mcp_resource.meta,
             tags=(mcp_resource.meta or {}).get("_fastmcp", {}).get("tags", []),
+            task_config=TaskConfig(mode="forbidden"),
             _mirrored=True,
         )
 
@@ -354,12 +387,14 @@ class ProxyTemplate(ResourceTemplate, MirroredComponent):
     A ResourceTemplate that represents and creates resources from a remote server template.
     """
 
-    def __init__(self, client: Client, **kwargs):
+    task_config: TaskConfig = TaskConfig(mode="forbidden")
+
+    def __init__(self, client: Client, **kwargs: Any):
         super().__init__(**kwargs)
         self._client = client
 
     @classmethod
-    def from_mcp_template(
+    def from_mcp_template(  # type: ignore[override]
         cls, client: Client, mcp_template: mcp.types.ResourceTemplate
     ) -> ProxyTemplate:
         """Factory method to create a ProxyTemplate from a raw MCP template schema."""
@@ -367,11 +402,14 @@ class ProxyTemplate(ResourceTemplate, MirroredComponent):
             client=client,
             uri_template=mcp_template.uriTemplate,
             name=mcp_template.name,
+            title=mcp_template.title,
             description=mcp_template.description,
             mime_type=mcp_template.mimeType or "text/plain",
+            icons=mcp_template.icons,
             parameters={},  # Remote templates don't have local parameters
             meta=mcp_template.meta,
             tags=(mcp_template.meta or {}).get("_fastmcp", {}).get("tags", []),
+            task_config=TaskConfig(mode="forbidden"),
             _mirrored=True,
         )
 
@@ -402,8 +440,10 @@ class ProxyTemplate(ResourceTemplate, MirroredComponent):
             client=self._client,
             uri=parameterized_uri,
             name=self.name,
+            title=self.title,
             description=self.description,
             mime_type=result[0].mimeType,
+            icons=self.icons,
             meta=self.meta,
             tags=(self.meta or {}).get("_fastmcp", {}).get("tags", []),
             _value=value,
@@ -415,6 +455,7 @@ class ProxyPrompt(Prompt, MirroredComponent):
     A Prompt that represents and renders a prompt from a remote server.
     """
 
+    task_config: TaskConfig = TaskConfig(mode="forbidden")
     _client: Client
 
     def __init__(self, client: Client, **kwargs):
@@ -437,14 +478,17 @@ class ProxyPrompt(Prompt, MirroredComponent):
         return cls(
             client=client,
             name=mcp_prompt.name,
+            title=mcp_prompt.title,
             description=mcp_prompt.description,
             arguments=arguments,
+            icons=mcp_prompt.icons,
             meta=mcp_prompt.meta,
             tags=(mcp_prompt.meta or {}).get("_fastmcp", {}).get("tags", []),
+            task_config=TaskConfig(mode="forbidden"),
             _mirrored=True,
         )
 
-    async def render(self, arguments: dict[str, Any]) -> list[PromptMessage]:
+    async def render(self, arguments: dict[str, Any]) -> list[PromptMessage]:  # type: ignore[override]
         """Render the prompt by making a call through the client."""
         async with self._client:
             result = await self._client.get_prompt(self.name, arguments)
@@ -459,9 +503,8 @@ class FastMCPProxy(FastMCP):
 
     def __init__(
         self,
-        client: Client | None = None,
         *,
-        client_factory: ClientFactoryT | None = None,
+        client_factory: ClientFactoryT,
         **kwargs,
     ):
         """
@@ -471,9 +514,6 @@ class FastMCPProxy(FastMCP):
         Use FastMCP.as_proxy() for convenience with automatic session strategy.
 
         Args:
-            client: [DEPRECATED] A Client instance. Use client_factory instead for explicit
-                   session management. When provided, a client_factory will be automatically
-                   created that provides session isolation for backwards compatibility.
             client_factory: A callable that returns a Client instance when called.
                            This gives you full control over session creation and reuse.
                            Can be either a synchronous or asynchronous function.
@@ -482,29 +522,7 @@ class FastMCPProxy(FastMCP):
 
         super().__init__(**kwargs)
 
-        # Handle client and client_factory parameters
-        if client is not None and client_factory is not None:
-            raise ValueError("Cannot specify both 'client' and 'client_factory'")
-
-        if client is not None:
-            # Deprecated in 2.10.3
-            if fastmcp.settings.deprecation_warnings:
-                warnings.warn(
-                    "Passing 'client' to FastMCPProxy is deprecated. Use 'client_factory' instead for explicit session management. "
-                    "For automatic session strategy, use FastMCP.as_proxy().",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-
-            # Create a factory that provides session isolation for backwards compatibility
-            def deprecated_client_factory():
-                return client.new()
-
-            self.client_factory = deprecated_client_factory
-        elif client_factory is not None:
-            self.client_factory = client_factory
-        else:
-            raise ValueError("Must specify 'client_factory'")
+        self.client_factory = client_factory
 
         # Replace the default managers with our specialized proxy managers.
         self._tool_manager = ProxyToolManager(
@@ -537,7 +555,7 @@ class ProxyClient(Client[ClientTransportT]):
     def __init__(
         self,
         transport: ClientTransportT
-        | FastMCP
+        | FastMCP[Any]
         | FastMCP1Server
         | AnyUrl
         | Path
@@ -558,7 +576,7 @@ class ProxyClient(Client[ClientTransportT]):
             kwargs["log_handler"] = ProxyClient.default_log_handler
         if "progress_handler" not in kwargs:
             kwargs["progress_handler"] = ProxyClient.default_progress_handler
-        super().__init__(**kwargs | dict(transport=transport))
+        super().__init__(**kwargs | {"transport": transport})
 
     @classmethod
     async def default_sampling_handler(
@@ -572,7 +590,7 @@ class ProxyClient(Client[ClientTransportT]):
         """
         ctx = get_context()
         content = await ctx.sample(
-            [msg for msg in messages],
+            list(messages),
             system_prompt=params.systemPrompt,
             temperature=params.temperature,
             max_tokens=params.maxTokens,
@@ -583,7 +601,8 @@ class ProxyClient(Client[ClientTransportT]):
         return mcp.types.CreateMessageResult(
             role="assistant",
             model="fastmcp-client",
-            content=content,
+            # TODO(ty): remove when ty supports isinstance exclusion narrowing
+            content=content,  # type: ignore[arg-type]
         )
 
     @classmethod
@@ -598,9 +617,15 @@ class ProxyClient(Client[ClientTransportT]):
         A handler that forwards the elicitation request from the remote server to the proxy's connected clients and relays the response back to the remote server.
         """
         ctx = get_context()
+        # requestedSchema only exists on ElicitRequestFormParams, not ElicitRequestURLParams
+        requested_schema = (
+            params.requestedSchema
+            if isinstance(params, ElicitRequestFormParams)
+            else {"type": "object", "properties": {}}
+        )
         result = await ctx.session.elicit(
             message=message,
-            requestedSchema=params.requestedSchema,
+            requestedSchema=requested_schema,
             related_request_id=ctx.request_id,
         )
         return ElicitResult(action=result.action, content=result.content)
@@ -640,16 +665,15 @@ class StatefulProxyClient(ProxyClient[ClientTransportT]):
     Note that it is essential to ensure that the proxy server itself is also stateful.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self._caches: dict[ServerSession, Client[ClientTransportT]] = {}
 
-    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:  # type: ignore[override]
         """
         The stateful proxy client will be forced disconnected when the session is exited.
         So we do nothing here.
         """
-        pass
 
     async def clear(self):
         """

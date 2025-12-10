@@ -5,10 +5,10 @@ from __future__ import annotations
 import inspect
 import re
 from collections.abc import Callable
-from typing import Any
-from urllib.parse import unquote
+from typing import Annotated, Any
+from urllib.parse import parse_qs, unquote
 
-from mcp.types import Annotations
+from mcp.types import Annotations, Icon
 from mcp.types import ResourceTemplate as MCPResourceTemplate
 from pydantic import (
     Field,
@@ -17,17 +17,33 @@ from pydantic import (
 )
 
 from fastmcp.resources.resource import Resource
-from fastmcp.server.dependencies import get_context
+from fastmcp.server.dependencies import get_context, without_injected_parameters
+from fastmcp.server.tasks.config import TaskConfig
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.json_schema import compress_schema
-from fastmcp.utilities.types import (
-    find_kwarg_by_type,
-    get_cached_typeadapter,
-)
+from fastmcp.utilities.types import get_cached_typeadapter
+
+
+def extract_query_params(uri_template: str) -> set[str]:
+    """Extract query parameter names from RFC 6570 `{?param1,param2}` syntax."""
+    match = re.search(r"\{\?([^}]+)\}", uri_template)
+    if match:
+        return {p.strip() for p in match.group(1).split(",")}
+    return set()
 
 
 def build_regex(template: str) -> re.Pattern:
-    parts = re.split(r"(\{[^}]+\})", template)
+    """Build regex pattern for URI template, handling RFC 6570 syntax.
+
+    Supports:
+    - `{var}` - simple path parameter
+    - `{var*}` - wildcard path parameter (captures multiple segments)
+    - `{?var1,var2}` - query parameters (ignored in path matching)
+    """
+    # Remove query parameter syntax for path matching
+    template_without_query = re.sub(r"\{\?[^}]+\}", "", template)
+
+    parts = re.split(r"(\{[^}]+\})", template_without_query)
     pattern = ""
     for part in parts:
         if part.startswith("{") and part.endswith("}"):
@@ -43,11 +59,34 @@ def build_regex(template: str) -> re.Pattern:
 
 
 def match_uri_template(uri: str, uri_template: str) -> dict[str, str] | None:
+    """Match URI against template and extract both path and query parameters.
+
+    Supports RFC 6570 URI templates:
+    - Path params: `{var}`, `{var*}`
+    - Query params: `{?var1,var2}`
+    """
+    # Split URI into path and query parts
+    uri_path, _, query_string = uri.partition("?")
+
+    # Match path parameters
     regex = build_regex(uri_template)
-    match = regex.match(uri)
-    if match:
-        return {k: unquote(v) for k, v in match.groupdict().items()}
-    return None
+    match = regex.match(uri_path)
+    if not match:
+        return None
+
+    params = {k: unquote(v) for k, v in match.groupdict().items()}
+
+    # Extract query parameters if present in URI and template
+    if query_string:
+        query_param_names = extract_query_params(uri_template)
+        parsed_query = parse_qs(query_string)
+
+        for name in query_param_names:
+            if name in parsed_query:
+                # Take first value if multiple provided
+                params[name] = parsed_query[name][0]  # type: ignore[index]
+
+    return params
 
 
 class ResourceTemplate(FastMCPComponent):
@@ -92,11 +131,13 @@ class ResourceTemplate(FastMCPComponent):
         name: str | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[Icon] | None = None,
         mime_type: str | None = None,
         tags: set[str] | None = None,
         enabled: bool | None = None,
         annotations: Annotations | None = None,
         meta: dict[str, Any] | None = None,
+        task: bool | TaskConfig | None = None,
     ) -> FunctionResourceTemplate:
         return FunctionResourceTemplate.from_function(
             fn=fn,
@@ -104,11 +145,13 @@ class ResourceTemplate(FastMCPComponent):
             name=name,
             title=title,
             description=description,
+            icons=icons,
             mime_type=mime_type,
             tags=tags,
             enabled=enabled,
             annotations=annotations,
             meta=meta,
+            task=task,
         )
 
     @field_validator("mime_type", mode="before")
@@ -130,21 +173,14 @@ class ResourceTemplate(FastMCPComponent):
         )
 
     async def create_resource(self, uri: str, params: dict[str, Any]) -> Resource:
-        """Create a resource from the template with the given parameters."""
+        """Create a resource from the template with the given parameters.
 
-        async def resource_read_fn() -> str | bytes:
-            # Call function and check if result is a coroutine
-            result = await self.read(arguments=params)
-            return result
-
-        return Resource.from_function(
-            fn=resource_read_fn,
-            uri=uri,
-            name=self.name,
-            description=self.description,
-            mime_type=self.mime_type,
-            tags=self.tags,
-            enabled=self.enabled,
+        The base implementation does not support background tasks.
+        Use FunctionResourceTemplate for task support.
+        """
+        raise NotImplementedError(
+            "Subclasses must implement create_resource(). "
+            "Use FunctionResourceTemplate for task support."
         )
 
     def to_mcp_template(
@@ -161,6 +197,7 @@ class ResourceTemplate(FastMCPComponent):
             description=overrides.get("description", self.description),
             mimeType=overrides.get("mimeType", self.mime_type),
             title=overrides.get("title", self.title),
+            icons=overrides.get("icons", self.icons),
             annotations=overrides.get("annotations", self.annotations),
             _meta=overrides.get(
                 "_meta", self.get_meta(include_fastmcp_meta=include_fastmcp_meta)
@@ -195,20 +232,59 @@ class FunctionResourceTemplate(ResourceTemplate):
     """A template for dynamically creating resources."""
 
     fn: Callable[..., Any]
+    task_config: Annotated[
+        TaskConfig,
+        Field(description="Background task execution configuration (SEP-1686)."),
+    ] = Field(default_factory=lambda: TaskConfig(mode="forbidden"))
+
+    async def create_resource(self, uri: str, params: dict[str, Any]) -> Resource:
+        """Create a resource from the template with the given parameters."""
+
+        async def resource_read_fn() -> str | bytes:
+            # Call function and check if result is a coroutine
+            result = await self.read(arguments=params)
+            return result
+
+        return Resource.from_function(
+            fn=resource_read_fn,
+            uri=uri,
+            name=self.name,
+            description=self.description,
+            mime_type=self.mime_type,
+            tags=self.tags,
+            enabled=self.enabled,
+            task=self.task_config,
+        )
 
     async def read(self, arguments: dict[str, Any]) -> str | bytes:
         """Read the resource content."""
-        from fastmcp.server.context import Context
-
-        # Add context to parameters if needed
+        # Type coercion for query parameters (which arrive as strings)
         kwargs = arguments.copy()
-        context_kwarg = find_kwarg_by_type(self.fn, kwarg_type=Context)
-        if context_kwarg and context_kwarg not in kwargs:
-            kwargs[context_kwarg] = get_context()
+        sig = inspect.signature(self.fn)
+        for param_name, param_value in list(kwargs.items()):
+            if param_name in sig.parameters and isinstance(param_value, str):
+                param = sig.parameters[param_name]
+                annotation = param.annotation
 
+                if annotation is inspect.Parameter.empty or annotation is str:
+                    continue
+
+                try:
+                    if annotation is int:
+                        kwargs[param_name] = int(param_value)
+                    elif annotation is float:
+                        kwargs[param_name] = float(param_value)
+                    elif annotation is bool:
+                        kwargs[param_name] = param_value.lower() in ("true", "1", "yes")
+                except (ValueError, AttributeError):
+                    pass
+
+        # self.fn is wrapped by without_injected_parameters which handles
+        # dependency resolution internally, so we call it directly
         result = self.fn(**kwargs)
         if inspect.isawaitable(result):
             result = await result
+
         return result
 
     @classmethod
@@ -219,14 +295,15 @@ class FunctionResourceTemplate(ResourceTemplate):
         name: str | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[Icon] | None = None,
         mime_type: str | None = None,
         tags: set[str] | None = None,
         enabled: bool | None = None,
         annotations: Annotations | None = None,
         meta: dict[str, Any] | None = None,
+        task: bool | TaskConfig | None = None,
     ) -> FunctionResourceTemplate:
         """Create a template from a function."""
-        from fastmcp.server.context import Context
 
         func_name = name or getattr(fn, "__name__", None) or fn.__class__.__name__
         if func_name == "<lambda>":
@@ -241,45 +318,68 @@ class FunctionResourceTemplate(ResourceTemplate):
                     "Functions with *args are not supported as resource templates"
                 )
 
-        # Auto-detect context parameter if not provided
+        # Extract path and query parameters from URI template
+        path_params = set(re.findall(r"{(\w+)(?:\*)?}", uri_template))
+        query_params = extract_query_params(uri_template)
+        all_uri_params = path_params | query_params
 
-        context_kwarg = find_kwarg_by_type(fn, kwarg_type=Context)
-
-        # Validate that URI params match function params
-        uri_params = set(re.findall(r"{(\w+)(?:\*)?}", uri_template))
-        if not uri_params:
+        if not all_uri_params:
             raise ValueError("URI template must contain at least one parameter")
 
-        func_params = set(sig.parameters.keys())
-        if context_kwarg:
-            func_params.discard(context_kwarg)
+        # Use wrapper to get user-facing parameters (excludes injected params)
+        wrapper_fn = without_injected_parameters(fn)
+        user_sig = inspect.signature(wrapper_fn)
+        func_params = set(user_sig.parameters.keys())
 
-        # get the parameters that are required
+        # Get required and optional function parameters
         required_params = {
             p
             for p in func_params
-            if sig.parameters[p].default is inspect.Parameter.empty
-            and sig.parameters[p].kind != inspect.Parameter.VAR_KEYWORD
-            and p != context_kwarg
+            if user_sig.parameters[p].default is inspect.Parameter.empty
+            and user_sig.parameters[p].kind != inspect.Parameter.VAR_KEYWORD
+        }
+        optional_params = {
+            p
+            for p in func_params
+            if user_sig.parameters[p].default is not inspect.Parameter.empty
+            and user_sig.parameters[p].kind != inspect.Parameter.VAR_KEYWORD
         }
 
-        # Check if required parameters are a subset of the URI parameters
-        if not required_params.issubset(uri_params):
+        # Validate RFC 6570 query parameters
+        # Query params must be optional (have defaults)
+        if query_params:
+            invalid_query_params = query_params - optional_params
+            if invalid_query_params:
+                raise ValueError(
+                    f"Query parameters {invalid_query_params} must be optional function parameters with default values"
+                )
+
+        # Check if required parameters are a subset of the path parameters
+        if not required_params.issubset(path_params):
             raise ValueError(
-                f"Required function arguments {required_params} must be a subset of the URI parameters {uri_params}"
+                f"Required function arguments {required_params} must be a subset of the URI path parameters {path_params}"
             )
 
-        # Check if the URI parameters are a subset of the function parameters (skip if **kwargs present)
+        # Check if all URI parameters are valid function parameters (skip if **kwargs present)
         if not any(
             param.kind == inspect.Parameter.VAR_KEYWORD
             for param in sig.parameters.values()
         ):
-            if not uri_params.issubset(func_params):
+            if not all_uri_params.issubset(func_params):
                 raise ValueError(
-                    f"URI parameters {uri_params} must be a subset of the function arguments: {func_params}"
+                    f"URI parameters {all_uri_params} must be a subset of the function arguments: {func_params}"
                 )
 
         description = description or inspect.getdoc(fn)
+
+        # Normalize task to TaskConfig and validate
+        if task is None:
+            task_config = TaskConfig(mode="forbidden")
+        elif isinstance(task, bool):
+            task_config = TaskConfig.from_bool(task)
+        else:
+            task_config = task
+        task_config.validate_function(fn, func_name)
 
         # if the fn is a callable class, we need to get the __call__ method from here out
         if not inspect.isroutine(fn):
@@ -288,21 +388,20 @@ class FunctionResourceTemplate(ResourceTemplate):
         if isinstance(fn, staticmethod):
             fn = fn.__func__
 
-        type_adapter = get_cached_typeadapter(fn)
+        wrapper_fn = without_injected_parameters(fn)
+        type_adapter = get_cached_typeadapter(wrapper_fn)
         parameters = type_adapter.json_schema()
+        parameters = compress_schema(parameters, prune_titles=True)
 
-        # compress the schema
-        prune_params = [context_kwarg] if context_kwarg else None
-        parameters = compress_schema(parameters, prune_params=prune_params)
-
-        # ensure the arguments are properly cast
-        fn = validate_call(fn)
+        # Use validate_call on wrapper for runtime type coercion
+        fn = validate_call(wrapper_fn)
 
         return cls(
             uri_template=uri_template,
             name=func_name,
             title=title,
             description=description,
+            icons=icons,
             mime_type=mime_type or "text/plain",
             fn=fn,
             parameters=parameters,
@@ -310,4 +409,5 @@ class FunctionResourceTemplate(ResourceTemplate):
             enabled=enabled if enabled is not None else True,
             annotations=annotations,
             meta=meta,
+            task_config=task_config,
         )

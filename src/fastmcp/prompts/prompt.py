@@ -4,24 +4,23 @@ from __future__ import annotations as _annotations
 
 import inspect
 import json
-from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any
+from typing import Annotated, Any
 
 import pydantic_core
-from mcp.types import ContentBlock, PromptMessage, Role, TextContent
+from mcp.types import ContentBlock, Icon, PromptMessage, Role, TextContent
 from mcp.types import Prompt as MCPPrompt
 from mcp.types import PromptArgument as MCPPromptArgument
 from pydantic import Field, TypeAdapter
 
 from fastmcp.exceptions import PromptError
-from fastmcp.server.dependencies import get_context
+from fastmcp.server.dependencies import get_context, without_injected_parameters
+from fastmcp.server.tasks.config import TaskConfig
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.json_schema import compress_schema
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.types import (
     FastMCPBaseModel,
-    find_kwarg_by_type,
     get_cached_typeadapter,
 )
 
@@ -62,7 +61,7 @@ class PromptArgument(FastMCPBaseModel):
     )
 
 
-class Prompt(FastMCPComponent, ABC):
+class Prompt(FastMCPComponent):
     """A prompt template that can be rendered with parameters."""
 
     arguments: list[PromptArgument] | None = Field(
@@ -106,6 +105,7 @@ class Prompt(FastMCPComponent, ABC):
             description=overrides.get("description", self.description),
             arguments=arguments,
             title=overrides.get("title", self.title),
+            icons=overrides.get("icons", self.icons),
             _meta=overrides.get(
                 "_meta", self.get_meta(include_fastmcp_meta=include_fastmcp_meta)
             ),
@@ -117,9 +117,11 @@ class Prompt(FastMCPComponent, ABC):
         name: str | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[Icon] | None = None,
         tags: set[str] | None = None,
         enabled: bool | None = None,
         meta: dict[str, Any] | None = None,
+        task: bool | TaskConfig | None = None,
     ) -> FunctionPrompt:
         """Create a Prompt from a function.
 
@@ -134,24 +136,33 @@ class Prompt(FastMCPComponent, ABC):
             name=name,
             title=title,
             description=description,
+            icons=icons,
             tags=tags,
             enabled=enabled,
             meta=meta,
+            task=task,
         )
 
-    @abstractmethod
     async def render(
         self,
         arguments: dict[str, Any] | None = None,
     ) -> list[PromptMessage]:
-        """Render the prompt with arguments."""
-        raise NotImplementedError("Prompt.render() must be implemented by subclasses")
+        """Render the prompt with arguments.
+
+        This method is not implemented in the base Prompt class and must be
+        implemented by subclasses.
+        """
+        raise NotImplementedError("Subclasses must implement render()")
 
 
 class FunctionPrompt(Prompt):
     """A prompt that is a function."""
 
     fn: Callable[..., PromptResult | Awaitable[PromptResult]]
+    task_config: Annotated[
+        TaskConfig,
+        Field(description="Background task execution configuration (SEP-1686)."),
+    ] = Field(default_factory=lambda: TaskConfig(mode="forbidden"))
 
     @classmethod
     def from_function(
@@ -160,9 +171,11 @@ class FunctionPrompt(Prompt):
         name: str | None = None,
         title: str | None = None,
         description: str | None = None,
+        icons: list[Icon] | None = None,
         tags: set[str] | None = None,
         enabled: bool | None = None,
         meta: dict[str, Any] | None = None,
+        task: bool | TaskConfig | None = None,
     ) -> FunctionPrompt:
         """Create a Prompt from a function.
 
@@ -172,7 +185,6 @@ class FunctionPrompt(Prompt):
         - A dict (converted to a message)
         - A sequence of any of the above
         """
-        from fastmcp.server.context import Context
 
         func_name = name or getattr(fn, "__name__", None) or fn.__class__.__name__
 
@@ -188,25 +200,27 @@ class FunctionPrompt(Prompt):
 
         description = description or inspect.getdoc(fn)
 
+        # Normalize task to TaskConfig and validate
+        if task is None:
+            task_config = TaskConfig(mode="forbidden")
+        elif isinstance(task, bool):
+            task_config = TaskConfig.from_bool(task)
+        else:
+            task_config = task
+        task_config.validate_function(fn, func_name)
+
         # if the fn is a callable class, we need to get the __call__ method from here out
         if not inspect.isroutine(fn):
             fn = fn.__call__
         # if the fn is a staticmethod, we need to work with the underlying function
         if isinstance(fn, staticmethod):
-            fn = fn.__func__
+            fn = fn.__func__  # type: ignore[assignment]
 
-        type_adapter = get_cached_typeadapter(fn)
+        # Wrap fn to handle dependency resolution internally
+        wrapped_fn = without_injected_parameters(fn)
+        type_adapter = get_cached_typeadapter(wrapped_fn)
         parameters = type_adapter.json_schema()
-
-        # Auto-detect context parameter if not provided
-
-        context_kwarg = find_kwarg_by_type(fn, kwarg_type=Context)
-        if context_kwarg:
-            prune_params = [context_kwarg]
-        else:
-            prune_params = None
-
-        parameters = compress_schema(parameters, prune_params=prune_params)
+        parameters = compress_schema(parameters, prune_titles=True)
 
         # Convert parameters to PromptArguments
         arguments: list[PromptArgument] = []
@@ -221,7 +235,6 @@ class FunctionPrompt(Prompt):
                     if (
                         sig_param.annotation != inspect.Parameter.empty
                         and sig_param.annotation is not str
-                        and param_name != context_kwarg
                     ):
                         # Get the JSON schema for this specific parameter type
                         try:
@@ -253,40 +266,32 @@ class FunctionPrompt(Prompt):
             name=func_name,
             title=title,
             description=description,
+            icons=icons,
             arguments=arguments,
             tags=tags or set(),
             enabled=enabled if enabled is not None else True,
-            fn=fn,
+            fn=wrapped_fn,
             meta=meta,
+            task_config=task_config,
         )
 
     def _convert_string_arguments(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Convert string arguments to expected types based on function signature."""
-        from fastmcp.server.context import Context
+        from fastmcp.server.dependencies import without_injected_parameters
 
-        sig = inspect.signature(self.fn)
+        wrapper_fn = without_injected_parameters(self.fn)
+        sig = inspect.signature(wrapper_fn)
         converted_kwargs = {}
-
-        # Find context parameter name if any
-        context_param_name = find_kwarg_by_type(self.fn, kwarg_type=Context)
 
         for param_name, param_value in kwargs.items():
             if param_name in sig.parameters:
                 param = sig.parameters[param_name]
 
-                # Skip Context parameters - they're handled separately
-                if param_name == context_param_name:
-                    converted_kwargs[param_name] = param_value
-                    continue
-
                 # If parameter has no annotation or annotation is str, pass as-is
                 if (
                     param.annotation == inspect.Parameter.empty
                     or param.annotation is str
-                ):
-                    converted_kwargs[param_name] = param_value
-                # If argument is not a string, pass as-is (already properly typed)
-                elif not isinstance(param_value, str):
+                ) or not isinstance(param_value, str):
                     converted_kwargs[param_name] = param_value
                 else:
                     # Try to convert string argument using type adapter
@@ -307,7 +312,7 @@ class FunctionPrompt(Prompt):
                         raise PromptError(
                             f"Could not convert argument '{param_name}' with value '{param_value}' "
                             f"to expected type {param.annotation}. Error: {e}"
-                        )
+                        ) from e
             else:
                 # Parameter not in function signature, pass as-is
                 converted_kwargs[param_name] = param_value
@@ -319,8 +324,6 @@ class FunctionPrompt(Prompt):
         arguments: dict[str, Any] | None = None,
     ) -> list[PromptMessage]:
         """Render the prompt with arguments."""
-        from fastmcp.server.context import Context
-
         # Validate required arguments
         if self.arguments:
             required = {arg.name for arg in self.arguments if arg.required}
@@ -330,16 +333,14 @@ class FunctionPrompt(Prompt):
                 raise ValueError(f"Missing required arguments: {missing}")
 
         try:
-            # Prepare arguments with context
+            # Prepare arguments
             kwargs = arguments.copy() if arguments else {}
-            context_kwarg = find_kwarg_by_type(self.fn, kwarg_type=Context)
-            if context_kwarg and context_kwarg not in kwargs:
-                kwargs[context_kwarg] = get_context()
 
-            # Convert string arguments to expected types when needed
+            # Convert string arguments to expected types BEFORE validation
             kwargs = self._convert_string_arguments(kwargs)
 
-            # Call function and check if result is a coroutine
+            # self.fn is wrapped by without_injected_parameters which handles
+            # dependency resolution internally
             result = self.fn(**kwargs)
             if inspect.isawaitable(result):
                 result = await result
@@ -369,10 +370,12 @@ class FunctionPrompt(Prompt):
                                 content=TextContent(type="text", text=content),
                             )
                         )
-                except Exception:
-                    raise PromptError("Could not convert prompt result to message.")
+                except Exception as e:
+                    raise PromptError(
+                        "Could not convert prompt result to message."
+                    ) from e
 
             return messages
-        except Exception:
+        except Exception as e:
             logger.exception(f"Error rendering prompt {self.name}")
-            raise PromptError(f"Error rendering prompt {self.name}.")
+            raise PromptError(f"Error rendering prompt {self.name}.") from e
