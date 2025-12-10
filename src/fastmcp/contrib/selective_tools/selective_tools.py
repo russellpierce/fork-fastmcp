@@ -143,7 +143,7 @@ class SelectiveToolMiddleware(Middleware):
             # Return valid tools plus a synthetic error notice tool
             filtered_tools = [t for t in tools if t.key in valid_tools]
             notice_tool = self._create_error_notice_tool(invalid_tools, available_tools)
-            return filtered_tools + [notice_tool]
+            return [*filtered_tools, notice_tool]
 
         elif self.error_behavior == ErrorBehavior.FALLBACK:
             # Return all tools if any invalid
